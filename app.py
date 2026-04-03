@@ -7,12 +7,11 @@ from datetime import datetime
 import time
 
 # Configuração da Página
-st.set_page_config(page_title="B3 Scanner Engine", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="B3 Scanner Server", page_icon="🚀", layout="wide")
 
 # --- INICIALIZAÇÃO FIREBASE ---
 def init_firebase():
     if not firebase_admin._apps:
-        # No Streamlit Cloud, configure as Secrets com o JSON do seu Firebase
         if "firebase" in st.secrets:
             firebase_creds = dict(st.secrets["firebase"])
             cred = credentials.Certificate(firebase_creds)
@@ -20,11 +19,13 @@ def init_firebase():
         else:
             st.error("Erro: Configure as credenciais do Firebase nas 'Secrets' do Streamlit.")
             return None
-    return firestore.client()
+    
+    # ID do seu banco de dados específico
+    database_id = "ai-studio-92eeeca1-1ed5-4536-875f-36a3730ccdfe"
+    return firestore.client(database=database_id)
 
-# --- BUSCA DE DADOS VIA REQUESTS (Yahoo Finance JSON) ---
+# --- BUSCA DE DADOS VIA REQUESTS ---
 def get_yahoo_data(ticker_symbol):
-    # Endpoint de gráfico do Yahoo Finance
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}.SA?range=1y&interval=1d"
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
@@ -32,39 +33,52 @@ def get_yahoo_data(ticker_symbol):
     try:
         response = requests.get(url, headers=headers, timeout=15)
         data = response.json()
-        
         result = data['chart']['result'][0]
         timestamps = result['timestamp']
         closes = result['indicators']['quote'][0]['close']
+        volumes = result['indicators']['quote'][0]['volume']
+        lows = result['indicators']['quote'][0]['low']
+        highs = result['indicators']['quote'][0]['high']
         
-        # Criar DataFrame e limpar valores nulos
-        df = pd.DataFrame({'Close': closes}, index=pd.to_datetime(timestamps, unit='s'))
-        df = df.dropna()
-        return df
+        df = pd.DataFrame({
+            'Close': closes, 
+            'Volume': volumes,
+            'Low': lows,
+            'High': highs
+        }, index=pd.to_datetime(timestamps, unit='s'))
+        return df.dropna()
     except Exception as e:
         return None
 
-# --- LÓGICA DE ANÁLISE TÉCNICA ---
-def analyze_ticker(ticker_symbol):
-    df = get_yahoo_data(ticker_symbol)
-    if df is None or len(df) < 200:
+# --- LÓGICA DE ANÁLISE ---
+def analyze_ticker(ticker_symbol, df):
+    if df is None or len(df) < 50:
         return None
 
-    # Cálculos de Médias Móveis (Igual ao PWA)
+    # Médias Móveis
     df['MM9'] = df['Close'].rolling(window=9).mean()
     df['MM20'] = df['Close'].rolling(window=20).mean()
     df['MM50'] = df['Close'].rolling(window=50).mean()
-    df['MM200'] = df['Close'].rolling(window=200).mean()
+    df['VMed'] = df['Volume'].rolling(window=20).mean()
     
     last = df.iloc[-1]
     price = last['Close']
     mm9 = last['MM9']
     mm20 = last['MM20']
+    mm50 = last['MM50']
+    v_hoje = last['Volume']
+    v_med = last['VMed']
     
-    # Lógica de Sinal: Preço acima da MM20 e MM9
+    # Sinais
+    is_explosive = price > mm20 and price > mm9 and v_hoje > (v_med * 1.2)
     is_compra = price > mm20 and price > mm9
     
-    # Variação 3 meses (aprox. 60 pregões)
+    label = "AGUARDAR"
+    if is_explosive: label = "EXPLOSIVO"
+    elif is_compra: label = "COMPRA"
+    elif price > mm9: label = "ATENÇÃO"
+
+    # Variação 3 meses
     change_3m = ((price / df.iloc[-60]['Close']) - 1) * 100 if len(df) > 60 else 0
 
     return {
@@ -72,18 +86,21 @@ def analyze_ticker(ticker_symbol):
         "preco": round(float(price), 2),
         "mms9": round(float(mm9), 2),
         "mms20": round(float(mm20), 2),
-        "mms50": round(float(last['MM50']), 2),
-        "mms200": round(float(last['MM200']), 2),
+        "mms200": round(float(mm50), 2), # Mapeado para MM50 no PWA
+        "vHoje": int(v_hoje),
+        "vMed": int(v_med),
         "isCompra": bool(is_compra),
+        "isExplosive": bool(is_explosive),
+        "signalLabel": label,
         "changePerc": round(float(change_3m), 2),
-        "updatedAt": datetime.now().isoformat()
+        "updatedAt": datetime.now().isoformat(),
+        "score": round(float((price / mm50 - 1) * 100), 2) if mm50 > 0 else 0
     }
 
-# --- INTERFACE E EXECUÇÃO ---
-st.title("🚀 B3 Scanner - Engine de Dados")
-st.markdown("Esta aplicação processa os dados da B3 e sincroniza com o seu PWA via Firestore.")
+# --- UI ---
+st.title("🚀 B3 Scanner Server")
 
-# Lista completa de papéis do seu projeto
+# Lista completa de todos os 142 papéis do projeto
 ACOES_IBOV = [
     'ALOS3', 'ABEV3', 'ASAI3', 'AURE3', 'AXIA3', 'AXIA6', 'AXIA7', 'AZZA3',
     'B3SA3', 'BBSE3', 'BBDC3', 'BBDC4', 'BRAP4', 'BBAS3', 'BRKM5', 'BRAV3',
@@ -106,7 +123,7 @@ ACOES_IBOV = [
     'TGMA3', 'TEND3', 'TUPY3', 'UNIP6', 'VLID3', 'VULC3'
 ]
 
-if st.button("⚡ Iniciar Varredura"):
+if st.button("⚡ SINCRONIZAR AGORA"):
     db = init_firebase()
     if db:
         results = []
@@ -115,15 +132,15 @@ if st.button("⚡ Iniciar Varredura"):
         
         for i, ticker in enumerate(ACOES_IBOV):
             status_text.text(f"Processando {ticker} ({i+1}/{len(ACOES_IBOV)})...")
-            data = analyze_ticker(ticker)
+            df = get_yahoo_data(ticker)
+            data = analyze_ticker(ticker, df)
             if data:
-                # Salva no Firestore na coleção 'market_data'
+                # Salva no Firestore
                 db.collection('market_data').document(ticker).set(data)
                 results.append(data)
             
-            # Atualiza progresso
             progress_bar.progress((i + 1) / len(ACOES_IBOV))
-            time.sleep(0.05) # Pequena pausa para evitar bloqueios
+            time.sleep(0.05) # Pausa curta para evitar bloqueios
         
-        st.success(f"✅ Varredura concluída! {len(results)} ativos sincronizados.")
+        st.success(f"✅ Sincronizado! {len(results)} ativos atualizados no PWA.")
         st.dataframe(pd.DataFrame(results))
