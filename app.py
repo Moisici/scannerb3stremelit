@@ -6,25 +6,35 @@ from firebase_admin import credentials, firestore
 from datetime import datetime
 import time
 
-# Configuração da Página
+# --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="B3 Scanner Server", page_icon="🚀", layout="wide")
 
 # --- INICIALIZAÇÃO FIREBASE ---
 def init_firebase():
+    """Inicializa o Firebase utilizando as Secrets do Streamlit."""
     if not firebase_admin._apps:
         if "firebase" in st.secrets:
+            # Converte as secrets para dicionário Python
             firebase_creds = dict(st.secrets["firebase"])
+            # Ajuste para garantir que a private_key seja lida corretamente (trata quebras de linha)
+            if "private_key" in firebase_creds:
+                firebase_creds["private_key"] = firebase_creds["private_key"].replace("\\n", "\n")
+            
             cred = credentials.Certificate(firebase_creds)
             firebase_admin.initialize_app(cred)
         else:
-            st.error("Erro: Configure as credenciais do Firebase nas 'Secrets' do Streamlit.")
+            st.error("❌ Erro: Configure as credenciais do Firebase nas 'Secrets' do Streamlit.")
             return None
     
-    # ID do seu banco de dados específico
+    # ID do seu banco de dados específico (Named Database)
     database_id = "ai-studio-92eeeca1-1ed5-4536-875f-36a3730ccdfe"
-    return firestore.client(database=database_id)
+    try:
+        return firestore.client(database=database_id)
+    except Exception as e:
+        st.error(f"❌ Erro ao conectar ao banco {database_id}: {e}")
+        return firestore.client() # Tenta o (default) se o específico falhar
 
-# --- BUSCA DE DADOS VIA REQUESTS ---
+# --- BUSCA DE DADOS VIA REQUESTS (Yahoo Finance) ---
 def get_yahoo_data(ticker_symbol):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}.SA?range=1y&interval=1d"
     headers = {
@@ -33,29 +43,31 @@ def get_yahoo_data(ticker_symbol):
     try:
         response = requests.get(url, headers=headers, timeout=15)
         data = response.json()
+        
+        if not data['chart']['result']:
+            return None
+            
         result = data['chart']['result'][0]
         timestamps = result['timestamp']
-        closes = result['indicators']['quote'][0]['close']
-        volumes = result['indicators']['quote'][0]['volume']
-        lows = result['indicators']['quote'][0]['low']
-        highs = result['indicators']['quote'][0]['high']
+        indicators = result['indicators']['quote'][0]
         
         df = pd.DataFrame({
-            'Close': closes, 
-            'Volume': volumes,
-            'Low': lows,
-            'High': highs
+            'Close': indicators['close'], 
+            'Volume': indicators['volume'],
+            'Low': indicators['low'],
+            'High': indicators['high']
         }, index=pd.to_datetime(timestamps, unit='s'))
+        
         return df.dropna()
-    except Exception as e:
+    except Exception:
         return None
 
-# --- LÓGICA DE ANÁLISE ---
+# --- LÓGICA DE ANÁLISE TÉCNICA ---
 def analyze_ticker(ticker_symbol, df):
     if df is None or len(df) < 50:
         return None
 
-    # Médias Móveis
+    # Cálculo de Médias Móveis (Setup: 9, 20, 50)
     df['MM9'] = df['Close'].rolling(window=9).mean()
     df['MM20'] = df['Close'].rolling(window=20).mean()
     df['MM50'] = df['Close'].rolling(window=50).mean()
@@ -69,7 +81,7 @@ def analyze_ticker(ticker_symbol, df):
     v_hoje = last['Volume']
     v_med = last['VMed']
     
-    # Sinais
+    # Critérios de Sinais
     is_explosive = price > mm20 and price > mm9 and v_hoje > (v_med * 1.2)
     is_compra = price > mm20 and price > mm9
     
@@ -78,7 +90,7 @@ def analyze_ticker(ticker_symbol, df):
     elif is_compra: label = "COMPRA"
     elif price > mm9: label = "ATENÇÃO"
 
-    # Variação 3 meses
+    # Variação histórica (aprox. 3 meses)
     change_3m = ((price / df.iloc[-60]['Close']) - 1) * 100 if len(df) > 60 else 0
 
     return {
@@ -86,22 +98,23 @@ def analyze_ticker(ticker_symbol, df):
         "preco": round(float(price), 2),
         "mms9": round(float(mm9), 2),
         "mms20": round(float(mm20), 2),
-        "mms200": round(float(mm50), 2), # Mapeado para MM50 no PWA
-        "vHoje": int(v_hoje),
-        "vMed": int(v_med),
+        "mms200": round(float(mm50), 2), # Ajustado para o seu PWA
+        "vHoje": int(v_hoje or 0),
+        "vMed": int(v_med or 0),
         "isCompra": bool(is_compra),
         "isExplosive": bool(is_explosive),
         "signalLabel": label,
         "changePerc": round(float(change_3m), 2),
         "updatedAt": datetime.now().isoformat(),
-        "score": round(float((price / mm50 - 1) * 100), 2) if mm50 > 0 else 0
+        "score": round(float((price / mm50 - 1) * 100), 2) if mm50 and mm50 > 0 else 0
     }
 
-# --- UI ---
-st.title("🚀 B3 Scanner Server")
+# --- INTERFACE E EXECUÇÃO ---
+st.title("🚀 B3 Ultimate Scanner - Server")
+st.markdown("Sincronização de dados do mercado com o Firebase Cloud Firestore.")
 
-# Lista completa de todos os 142 papéis do projeto
-ACOES_IBOV = [
+# Lista de Ativos
+ACOES_B3 = [
     'ALOS3', 'ABEV3', 'ASAI3', 'AURE3', 'AXIA3', 'AXIA6', 'AXIA7', 'AZZA3',
     'B3SA3', 'BBSE3', 'BBDC3', 'BBDC4', 'BRAP4', 'BBAS3', 'BRKM5', 'BRAV3',
     'BPAC11', 'CXSE3', 'CEAB3', 'CMIG4', 'COGN3', 'CSMG3', 'CPLE3', 'CSAN3',
@@ -123,24 +136,43 @@ ACOES_IBOV = [
     'TGMA3', 'TEND3', 'TUPY3', 'UNIP6', 'VLID3', 'VULC3'
 ]
 
-if st.button("⚡ SINCRONIZAR AGORA"):
+if st.button("⚡ INICIAR SINCRONIZAÇÃO"):
     db = init_firebase()
     if db:
         results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        for i, ticker in enumerate(ACOES_IBOV):
-            status_text.text(f"Processando {ticker} ({i+1}/{len(ACOES_IBOV)})...")
+        # Uso do BATCH para evitar erros de conexão e limites de escrita
+        batch = db.batch()
+        count = 0
+        
+        for i, ticker in enumerate(ACOES_B3):
+            status_text.text(f"Analisando {ticker} ({i+1}/{len(ACOES_B3)})...")
+            
             df = get_yahoo_data(ticker)
             data = analyze_ticker(ticker, df)
-            if data:
-                # Salva no Firestore
-                db.collection('market_data').document(ticker).set(data)
-                results.append(data)
             
-            progress_bar.progress((i + 1) / len(ACOES_IBOV))
-            time.sleep(0.05) # Pausa curta para evitar bloqueios
+            if data:
+                doc_ref = db.collection('market_data').document(ticker)
+                batch.set(doc_ref, data)
+                results.append(data)
+                count += 1
+            
+            # Atualiza barra de progresso
+            progress_bar.progress((i + 1) / len(ACOES_B3))
+            
+            # Pequeno delay para respeitar o limite do Yahoo Finance
+            time.sleep(0.1)
         
-        st.success(f"✅ Sincronizado! {len(results)} ativos atualizados no PWA.")
-        st.dataframe(pd.DataFrame(results))
+        # Envio final de todos os dados processados em um único pacote
+        if count > 0:
+            status_text.text("🚀 Enviando pacote de dados para o Firebase...")
+            batch.commit()
+            st.success(f"✅ Sucesso! {count} ativos atualizados no Firebase.")
+            
+            # Exibe tabela resumida dos resultados
+            df_final = pd.DataFrame(results)
+            st.dataframe(df_final[['ticker', 'preco', 'signalLabel', 'changePerc']])
+        else:
+            st.warning("⚠️ Nenhum dado foi processado corretamente.")
