@@ -3,114 +3,98 @@ import requests
 import pandas as pd
 import firebase_admin
 from firebase_admin import credentials, firestore
-# Importação direta do cliente Google Cloud para garantir compatibilidade com bancos nomeados
-from google.cloud import firestore as google_firestore 
 from datetime import datetime
 import time
 
-# Configuração da Página
+# --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="B3 Scanner Server", page_icon="🚀", layout="wide")
 
 # --- INICIALIZAÇÃO FIREBASE ---
 def init_firebase():
     if not firebase_admin._apps:
         if "firebase" in st.secrets:
-            firebase_creds = dict(st.secrets["firebase"])
-            cred = credentials.Certificate(firebase_creds)
+            creds = dict(st.secrets["firebase"])
+            if "private_key" in creds:
+                creds["private_key"] = creds["private_key"].replace("\\n", "\n")
+            
+            cred = credentials.Certificate(creds)
             firebase_admin.initialize_app(cred)
         else:
-            st.error("Erro: Configure as credenciais do Firebase nas 'Secrets' do Streamlit.")
+            st.error("❌ Erro: Configure as credenciais no Secrets.")
             return None
     
-    # ID do seu banco de dados específico
-    database_id = "ai-studio-92eeeca1-1ed5-4536-875f-36a3730ccdfe"
-    project_id = st.secrets["firebase"]["project_id"]
-    
-    # Tenta inicializar o cliente de forma compatível
+    # Seu banco de dados específico
+    db_id = "ai-studio-92eeeca1-1ed5-4536-875f-36a3730ccdfe"
     try:
-        # Tenta o método padrão (funciona em versões recentes do firebase-admin)
-        return firestore.client(database=database_id)
-    except TypeError:
-        # Fallback para versões onde o wrapper do firebase_admin não aceita 'database'
-        # Usamos o cliente direto da Google Cloud Firestore
-        return google_firestore.Client(project=project_id, database=database_id)
+        return firestore.client(database_id=db_id)
+    except Exception:
+        return firestore.client()
 
-# --- BUSCA DE DADOS VIA REQUESTS (Yahoo Finance) ---
+# --- BUSCA E ANÁLISE ---
 def get_yahoo_data(ticker_symbol):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}.SA?range=1y&interval=1d"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
+    headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        response = requests.get(url, headers=headers, timeout=10)
         data = response.json()
         result = data['chart']['result'][0]
-        timestamps = result['timestamp']
-        indicators = result['indicators']['quote'][0]
-        
         df = pd.DataFrame({
-            'Close': indicators['close'], 
-            'Volume': indicators['volume'],
-            'Low': indicators['low'],
-            'High': indicators['high']
-        }, index=pd.to_datetime(timestamps, unit='s'))
+            'Close': result['indicators']['quote'][0]['close'], 
+            'Volume': result['indicators']['quote'][0]['volume'],
+            'Low': result['indicators']['quote'][0]['low'],
+            'High': result['indicators']['quote'][0]['high']
+        }, index=pd.to_datetime(result['timestamp'], unit='s'))
         return df.dropna()
-    except Exception as e:
+    except:
         return None
 
-# --- LÓGICA DE ANÁLISE TÉCNICA ---
-def analyze_ticker(ticker_symbol, df):
-    if df is None or len(df) < 50:
-        return None
-
-    # Médias Móveis
-    df['MM9'] = df['Close'].rolling(window=9).mean()
-    df['MM20'] = df['Close'].rolling(window=20).mean()
-    df['MM50'] = df['Close'].rolling(window=50).mean()
-    df['VMed'] = df['Volume'].rolling(window=20).mean()
+def analyze_ticker(ticker, df):
+    if df is None or len(df) < 50: return None
+    
+    # Médias Móveis (9, 20, 50)
+    df['MM9'] = df['Close'].rolling(9).mean()
+    df['MM20'] = df['Close'].rolling(20).mean()
+    df['MM50'] = df['Close'].rolling(50).mean()
+    df['VMed'] = df['Volume'].rolling(20).mean()
     
     last = df.iloc[-1]
     price = last['Close']
-    mm9 = last['MM9']
-    mm20 = last['MM20']
-    mm50 = last['MM50']
     v_hoje = last['Volume']
     v_med = last['VMed']
     
-    # Sinais
-    is_explosive = price > mm20 and price > mm9 and v_hoje > (v_med * 1.2)
-    is_compra = price > mm20 and price > mm9
+    # Lógica de Sinais
+    is_explosive = price > last['MM20'] and price > last['MM9'] and v_hoje > (v_med * 1.2)
+    is_compra = price > last['MM20'] and price > last['MM9']
     
     label = "AGUARDAR"
     if is_explosive: label = "EXPLOSIVO"
     elif is_compra: label = "COMPRA"
-    elif price > mm9: label = "ATENÇÃO"
+    elif price > last['MM9']: label = "ATENÇÃO"
 
-    # Variação 3 meses
+    # Variação 3 meses (aprox 60 dias)
     change_3m = ((price / df.iloc[-60]['Close']) - 1) * 100 if len(df) > 60 else 0
 
     return {
-        "ticker": ticker_symbol,
+        "ticker": ticker,
         "preco": round(float(price), 2),
-        "mms9": round(float(mm9), 2),
-        "mms20": round(float(mm20), 2),
-        "mms200": round(float(mm50), 2), # Mapeado para MM50 no PWA
-        "vHoje": int(v_hoje),
-        "vMed": int(v_med),
+        "mms9": round(float(last['MM9']), 2),
+        "mms20": round(float(last['MM20']), 2),
+        "mms200": round(float(last['MM50']), 2), # MM50 usada como referência longa
+        "vHoje": int(v_hoje or 0),
+        "vMed": int(v_med or 0),
         "isCompra": bool(is_compra),
         "isExplosive": bool(is_explosive),
         "signalLabel": label,
         "changePerc": round(float(change_3m), 2),
         "updatedAt": datetime.now().isoformat(),
-        "score": round(float((price / mm50 - 1) * 100), 2) if mm50 > 0 else 0
+        "score": round(float((price / last['MM50'] - 1) * 100), 2) if last['MM50'] > 0 else 0
     }
 
 # --- INTERFACE ---
-st.title("🚀 B3 Scanner Server")
-st.markdown("Sincronização de dados em tempo real com o PWA.")
+st.title("🚀 B3 Scanner Server - Full Sync")
 
-# Lista completa de todos os 142 papéis
-ACOES_IBOV = [
+# LISTA COMPLETA (142 PAPÉIS + BOVA11)
+ACOES_B3 = [
     'ALOS3', 'ABEV3', 'ASAI3', 'AURE3', 'AXIA3', 'AXIA6', 'AXIA7', 'AZZA3',
     'B3SA3', 'BBSE3', 'BBDC3', 'BBDC4', 'BRAP4', 'BBAS3', 'BRKM5', 'BRAV3',
     'BPAC11', 'CXSE3', 'CEAB3', 'CMIG4', 'COGN3', 'CSMG3', 'CPLE3', 'CSAN3',
@@ -132,24 +116,39 @@ ACOES_IBOV = [
     'TGMA3', 'TEND3', 'TUPY3', 'UNIP6', 'VLID3', 'VULC3', 'BOVA11'
 ]
 
-if st.button("⚡ SINCRONIZAR AGORA"):
+if st.button("⚡ INICIAR SINCRONIZAÇÃO COMPLETA"):
     db = init_firebase()
     if db:
         results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        for i, ticker in enumerate(ACOES_IBOV):
-            status_text.text(f"Analisando {ticker} ({i+1}/{len(ACOES_IBOV)})...")
+        # INICIA O LOTE (Batch)
+        batch = db.batch()
+        count = 0
+        
+        for i, ticker in enumerate(ACOES_B3):
+            status_text.text(f"📊 Analisando {ticker} ({i+1}/{len(ACOES_B3)})...")
             df = get_yahoo_data(ticker)
             data = analyze_ticker(ticker, df)
-            if data:
-                # Salva no Firestore
-                db.collection('market_data').document(ticker).set(data)
-                results.append(data)
             
-            progress_bar.progress((i + 1) / len(ACOES_IBOV))
+            if data:
+                doc_ref = db.collection('market_data').document(ticker)
+                batch.set(doc_ref, data)
+                results.append(data)
+                count += 1
+            
+            # Atualiza barra
+            progress_bar.progress((i + 1) / len(ACOES_B3))
+            
+            # Pequeno delay para respeitar limites de taxa
             time.sleep(0.05)
         
-        st.success(f"✅ Sincronização concluída! {len(results)} ativos atualizados.")
-        st.dataframe(pd.DataFrame(results))
+        if count > 0:
+            status_text.text("🚀 Gravando dados no Firestore via Batch...")
+            try:
+                batch.commit()
+                st.success(f"✅ Sucesso! {count} ativos atualizados no Firebase.")
+                st.dataframe(pd.DataFrame(results))
+            except Exception as e:
+                st.error(f"❌ Erro ao finalizar gravação: {e}")
