@@ -3,57 +3,47 @@ import requests
 import pandas as pd
 import firebase_admin
 from firebase_admin import credentials, firestore
+# Importação direta do cliente Google Cloud para garantir compatibilidade com bancos nomeados
+from google.cloud import firestore as google_firestore 
 from datetime import datetime
 import time
 
-# --- CONFIGURAÇÃO DA PÁGINA ---
+# Configuração da Página
 st.set_page_config(page_title="B3 Scanner Server", page_icon="🚀", layout="wide")
 
 # --- INICIALIZAÇÃO FIREBASE ---
 def init_firebase():
-    """Inicializa o Firebase utilizando as Secrets do Streamlit."""
     if not firebase_admin._apps:
         if "firebase" in st.secrets:
-            # Converte as secrets para dicionário Python
-            creds = dict(st.secrets["firebase"])
-            
-            # TRATAMENTO DA CHAVE: Garante que as quebras de linha (\n) sejam reais
-            if "private_key" in creds:
-                creds["private_key"] = creds["private_key"].replace("\\n", "\n")
-            
-            try:
-                cred = credentials.Certificate(creds)
-                firebase_admin.initialize_app(cred)
-            except Exception as e:
-                st.error(f"❌ Erro na certificação: {e}")
-                return None
+            firebase_creds = dict(st.secrets["firebase"])
+            cred = credentials.Certificate(firebase_creds)
+            firebase_admin.initialize_app(cred)
         else:
-            st.error("❌ Erro: Bloco [firebase] não encontrado nas Secrets.")
+            st.error("Erro: Configure as credenciais do Firebase nas 'Secrets' do Streamlit.")
             return None
     
     # ID do seu banco de dados específico
-    db_id = "ai-studio-92eeeca1-1ed5-4536-875f-36a3730ccdfe"
+    database_id = "ai-studio-92eeeca1-1ed5-4536-875f-36a3730ccdfe"
+    project_id = st.secrets["firebase"]["project_id"]
     
+    # Tenta inicializar o cliente de forma compatível
     try:
-        # CORREÇÃO: Usamos 'database_id' (versão nova) em vez de 'database'
-        return firestore.client(database_id=db_id)
-    except Exception as e:
-        st.warning(f"⚠️ Falha no banco {db_id}, tentando banco padrão. Erro: {e}")
-        return firestore.client()
+        # Tenta o método padrão (funciona em versões recentes do firebase-admin)
+        return firestore.client(database=database_id)
+    except TypeError:
+        # Fallback para versões onde o wrapper do firebase_admin não aceita 'database'
+        # Usamos o cliente direto da Google Cloud Firestore
+        return google_firestore.Client(project=project_id, database=database_id)
 
 # --- BUSCA DE DADOS VIA REQUESTS (Yahoo Finance) ---
 def get_yahoo_data(ticker_symbol):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}.SA?range=1y&interval=1d"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
     try:
         response = requests.get(url, headers=headers, timeout=15)
         data = response.json()
-        
-        if not data['chart']['result']:
-            return None
-            
         result = data['chart']['result'][0]
         timestamps = result['timestamp']
         indicators = result['indicators']['quote'][0]
@@ -64,9 +54,8 @@ def get_yahoo_data(ticker_symbol):
             'Low': indicators['low'],
             'High': indicators['high']
         }, index=pd.to_datetime(timestamps, unit='s'))
-        
         return df.dropna()
-    except Exception:
+    except Exception as e:
         return None
 
 # --- LÓGICA DE ANÁLISE TÉCNICA ---
@@ -105,9 +94,9 @@ def analyze_ticker(ticker_symbol, df):
         "preco": round(float(price), 2),
         "mms9": round(float(mm9), 2),
         "mms20": round(float(mm20), 2),
-        "mms200": round(float(mm50), 2), 
-        "vHoje": int(v_hoje or 0),
-        "vMed": int(v_med or 0),
+        "mms200": round(float(mm50), 2), # Mapeado para MM50 no PWA
+        "vHoje": int(v_hoje),
+        "vMed": int(v_med),
         "isCompra": bool(is_compra),
         "isExplosive": bool(is_explosive),
         "signalLabel": label,
@@ -118,10 +107,10 @@ def analyze_ticker(ticker_symbol, df):
 
 # --- INTERFACE ---
 st.title("🚀 B3 Scanner Server")
-st.markdown("Sincronização de dados em tempo real com o Firestore.")
+st.markdown("Sincronização de dados em tempo real com o PWA.")
 
-# Lista de Ativos
-ACOES_B3 = [
+# Lista completa de todos os 142 papéis
+ACOES_IBOV = [
     'ALOS3', 'ABEV3', 'ASAI3', 'AURE3', 'AXIA3', 'AXIA6', 'AXIA7', 'AZZA3',
     'B3SA3', 'BBSE3', 'BBDC3', 'BBDC4', 'BRAP4', 'BBAS3', 'BRKM5', 'BRAV3',
     'BPAC11', 'CXSE3', 'CEAB3', 'CMIG4', 'COGN3', 'CSMG3', 'CPLE3', 'CSAN3',
@@ -150,27 +139,17 @@ if st.button("⚡ SINCRONIZAR AGORA"):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # --- SISTEMA DE BATCH (Evita RetryError) ---
-        batch = db.batch()
-        
-        for i, ticker in enumerate(ACOES_B3):
-            status_text.text(f"Processando {ticker} ({i+1}/{len(ACOES_B3)})...")
+        for i, ticker in enumerate(ACOES_IBOV):
+            status_text.text(f"Analisando {ticker} ({i+1}/{len(ACOES_IBOV)})...")
             df = get_yahoo_data(ticker)
             data = analyze_ticker(ticker, df)
-            
             if data:
-                doc_ref = db.collection('market_data').document(ticker)
-                batch.set(doc_ref, data)
+                # Salva no Firestore
+                db.collection('market_data').document(ticker).set(data)
                 results.append(data)
             
-            progress_bar.progress((i + 1) / len(ACOES_B3))
-            time.sleep(0.1) # Pausa leve para o Yahoo Finance
+            progress_bar.progress((i + 1) / len(ACOES_IBOV))
+            time.sleep(0.05)
         
-        # Envia tudo de uma vez
-        status_text.text("🚀 Finalizando gravação no banco...")
-        try:
-            batch.commit()
-            st.success(f"✅ Sincronização concluída! {len(results)} ativos atualizados.")
-            st.dataframe(pd.DataFrame(results))
-        except Exception as e:
-            st.error(f"❌ Erro ao salvar no banco: {e}")
+        st.success(f"✅ Sincronização concluída! {len(results)} ativos atualizados.")
+        st.dataframe(pd.DataFrame(results))
