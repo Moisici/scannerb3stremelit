@@ -49,9 +49,12 @@ def get_yahoo_data(ticker):
         if not data['chart']['result']: return None
         
         result = data['chart']['result'][0]
+        # Adicionado High e Low para o cálculo de 52 semanas
         df = pd.DataFrame({
             'Close': result['indicators']['quote'][0]['close'], 
-            'Volume': result['indicators']['quote'][0]['volume']
+            'Volume': result['indicators']['quote'][0]['volume'],
+            'High': result['indicators']['quote'][0]['high'],
+            'Low': result['indicators']['quote'][0]['low']
         }, index=pd.to_datetime(result['timestamp'], unit='s'))
         return df.dropna()
     except:
@@ -66,6 +69,10 @@ def analyze_ticker(ticker, df):
     df['MM20'] = df['Close'].rolling(20).mean()
     df['MM50'] = df['Close'].rolling(50).mean()
     df['VMed'] = df['Volume'].rolling(20).mean()
+    
+    # Cálculo de Mínima e Máxima de 52 semanas (baseado no range de 1 ano do DF)
+    min_52 = df['Low'].min()
+    max_52 = df['High'].max()
     
     last = df.iloc[-1]
     price = last['Close']
@@ -85,6 +92,8 @@ def analyze_ticker(ticker, df):
     return {
         "ticker": ticker,
         "preco": round(float(price), 2),
+        "min52": round(float(min_52), 2),    # NOVO: Mínima 52 sem
+        "max52": round(float(max_52), 2),    # NOVO: Máxima 52 sem
         "mms9": round(float(last['MM9']), 2),
         "mms20": round(float(last['MM20']), 2),
         "mms200": round(float(last['MM50']), 2), # Mapeado para MM50 para o PWA
@@ -100,7 +109,7 @@ def analyze_ticker(ticker, df):
 
 # --- UI STREAMLIT ---
 st.title("🚀 B3 Ultimate Scanner - Server")
-st.info("Sincronização em Lote (Batch) para evitar erros de Timeout.")
+st.info("Sincronização em Lote (Batch) com métricas de 52 semanas.")
 
 # Lista Completa de Ativos
 ACOES_B3 = [
@@ -113,12 +122,12 @@ ACOES_B3 = [
     'RAIZ4', 'RDOR3', 'RAIL3', 'SBSP3', 'SANB11', 'CSNA3', 'SLCE3', 'SMFT3', 'SUZB3', 'TAEE11', 
     'VIVT3', 'TIMS3', 'TOTS3', 'UGPA3', 'USIM5', 'VALE3', 'VAMO3', 'VBBR3', 'VIVA3', 'WEGE3', 
     'YDUQ3', 'TTEN3', 'ABCB4', 'ALPA4', 'ALUP11', 'ANIM3', 'ARML3', 'AMOB3', 'BPAN4', 'BRSR6', 
-    'BMOB3', 'BLAU3', 'SOJA3', 'BRBI11', 'AGRO3', 'CAML3', 'BHIA3', 'CVCB3', 'DESK3', 'DXCO3', 
-    'PNVL3', 'ECOR3', 'EVEN3', 'EZTC3', 'FESA4', 'FRAS3', 'GFSA3', 'GGPS3', 'GRND3', 'GMAT3', 
-    'SBFG3', 'GUAR3', 'HBOR3', 'HBSA3', 'INTB3', 'MYPK3', 'RANI3', 'JHSF3', 'JSLG3', 'KEPL3', 
-    'LAVV3', 'LOGG3', 'LWSA3', 'MDIA3', 'CASH3', 'LEVE3', 'MILS3', 'MOVI3', 'ODPV3', 'ONCO3', 
-    'ORVR3', 'PGMN3', 'PLPL3', 'POSI3', 'PRNR3', 'QUAL3', 'LJQQ3', 'RAPT4', 'SAPR11', 'SMTO3', 
-    'SEER3', 'SIMH3', 'SYNE3', 'TGMA3', 'TEND3', 'TUPY3', 'UNIP6', 'VLID3', 'VULC3', 'BOVA11'
+    'BMOB3', 'BLAU3', 'SOJA3', 'BRBI11', 'AGRO3', 'CAML3', 'BHIA3', 'CBAV3', 'CVCB3', 'DESK3', 
+    'DXCO3', 'PNVL3', 'ECOR3', 'EVEN3', 'EZTC3', 'FESA4', 'FRAS3', 'GFSA3', 'GGPS3', 'GRND3', 
+    'GMAT3', 'SBFG3', 'GUAR3', 'HBOR3', 'HBSA3', 'INTB3', 'MYPK3', 'RANI3', 'JHSF3', 'JSLG3', 
+    'KEPL3', 'LAVV3', 'LOGG3', 'LWSA3', 'MDIA3', 'CASH3', 'LEVE3', 'MILS3', 'MOVI3', 'ODPV3', 
+    'ONCO3', 'ORVR3', 'PGMN3', 'PLPL3', 'POSI3', 'PRNR3', 'QUAL3', 'LJQQ3', 'RAPT4', 'SAPR11', 
+    'SMTO3', 'SEER3', 'SIMH3', 'SYNE3', 'TGMA3', 'TEND3', 'TUPY3', 'UNIP6', 'VLID3', 'VULC3', 'BOVA11'
 ]
 
 if st.button("⚡ INICIAR SINCRONIZAÇÃO"):
@@ -128,7 +137,6 @@ if st.button("⚡ INICIAR SINCRONIZAÇÃO"):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # --- SISTEMA DE BATCH ---
         batch = db.batch()
         count = 0
         
@@ -144,13 +152,14 @@ if st.button("⚡ INICIAR SINCRONIZAÇÃO"):
                 count += 1
             
             progress_bar.progress((i + 1) / len(ACOES_B3))
-            time.sleep(0.05) # Delay mínimo anti-bloqueio
+            time.sleep(0.05)
         
         if count > 0:
-            status_text.text("🚀 Enviando pacote de dados para o Firebase...")
+            status_text.text("🚀 Enviando pacote para o Firebase...")
             try:
-                batch.commit() # Gravação atômica única
-                st.success(f"✅ Sucesso! {count} ativos atualizados.")
-                st.dataframe(pd.DataFrame(results)[['ticker', 'preco', 'signalLabel', 'changePerc']])
+                batch.commit()
+                st.success(f"✅ Sucesso! {count} ativos atualizados com Mín/Máx 52 sem.")
+                # Exibe na tabela para conferência
+                st.dataframe(pd.DataFrame(results)[['ticker', 'preco', 'min52', 'max52', 'signalLabel']])
             except Exception as e:
                 st.error(f"❌ Erro ao gravar no banco: {e}")
